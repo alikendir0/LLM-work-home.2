@@ -2,7 +2,7 @@ import os
 import time
 from google import genai
 from google.genai import types, errors
-
+#selam
 # === CONFIGURATION ===
 MODEL = "gemini-2.5-flash"          # You can change this if you have access to pro
 MAX_TOKENS = 128_000                # Safe default context window
