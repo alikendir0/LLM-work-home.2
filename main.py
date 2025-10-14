@@ -4,7 +4,6 @@ import asyncio
 import inspect
 from google import genai
 from google.genai import types, errors
-<<<<<<< HEAD
 from google.api_core import exceptions
 
 =======
