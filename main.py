@@ -6,9 +6,6 @@ from google import genai
 from google.genai import types, errors
 from google.api_core import exceptions
 
-=======
-#selam
->>>>>>> 0f9e08c66a29fdc0bae70c2ad14965a60c9ad8ec
 # === CONFIGURATION ===
 MODEL = "gemini-2.5-flash-lite"          # You can change this if you have access to pro
 MAX_TOKENS = 250_000                # Safe default context window
