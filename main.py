@@ -7,19 +7,18 @@ from google.genai import types, errors
 from google.api_core import exceptions
 
 # === CONFIGURATION ===
-MODEL = "gemini-2.5-flash-lite"          # You can change this if you have access to pro
-MAX_TOKENS = 250_000                # Safe default context window
-WARN_THRESHOLD = 0.8                # 80% usage triggers warning
-MAX_RETRIES = 3                     # Retry attempts for rate limits
-RETRY_BASE_DELAY = 2
-API_DELAY_SUBTRACTION = 20            # Seconds to subtract from API-suggested retry delay to optimize wait time
+MODEL = "gemini-2.5-flash-lite"          # We choose gemini-2.5-flash-lite for its high rate limits and large daily quota
+MAX_TOKENS = 250_000                # Safe default context window, also the max per minute token for gemini-2.5-flash-lite
+WARN_THRESHOLD = 0.4                # 70% usage triggers warning, since this is a stress test we lower the threshold only to get the warning
+MAX_RETRIES = 4                     # Retry attempts for rate limits
+RETRY_BASE_DELAY = 2            # Base delay in seconds for exponential backoff
 
 # === GLOBAL TOKEN COUNTERS ===
-PROMPT_TOKENS_TOTAL = 0
-RESPONSE_TOKENS_TOTAL = 0
+PROMPT_TOKENS_TOTAL = 0         # Total prompt tokens used
+RESPONSE_TOKENS_TOTAL = 0       # Total response tokens used
 
 
-# === UTILS ===
+# === UTILS === # Simple colored console output
 def warn(msg): print(f"\033[93m[WARNING]\033[0m {msg}")
 def info(msg): print(f"\033[94m[INFO]\033[0m {msg}")
 def ok(msg): print(f"\033[92m[OK]\033[0m {msg}")
@@ -27,10 +26,10 @@ def error(msg): print(f"\033[91m[ERROR]\033[0m {msg}")
 
 # === INITIALIZE CLIENT ===
 def init_client():
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")  # Make sure to set your Gemini API key in environment variables
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not found in environment variables.")
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key) # Initialize the Gemini client
     ok(f"Gemini client initialized with model '{MODEL}'")
     return client
 
@@ -44,44 +43,46 @@ def count_tokens(client, contents) -> int:
         # Handle async count_tokens
         if inspect.isawaitable(maybe):
             try:
-                resp = asyncio.run(maybe)  # type: ignore
+                resp = asyncio.run(maybe)  # type: ignore # we run the async func to get the reuslt
             except RuntimeError:
-                warn("Token counting skipped because an event loop is already running.")
+                warn("Token counting skipped because an event loop is already running.") #if running fails
                 return 0
         else:
-            resp = maybe
+            resp = maybe #if result is not async
         
         # Extract total_tokens from response
-        total = getattr(resp, "total_tokens", None)
-        if total is None and hasattr(resp, "get"):
+        total = getattr(resp, "total_tokens", None) #tries getting "total tokens" attribute from the response
+        if total is None and hasattr(resp, "get"): #if response is dict not obj extract total tokens like this
             total = resp.get("total_tokens", 0)
         
-        return int(total) if total else 0
-    except Exception as e:
+        return int(total) if total else 0 #valid token num return, else 0
+    except Exception as e: #in case of error print waning
         warn(f"Token counting failed: {e}. Proceeding without token count.")
         return 0
 
-def check_context_window(client, contents_for_count):
-    """Count tokens for a would-be request (e.g., prompt or chat history) and warn if near limit."""
-    total = count_tokens(client, contents_for_count)
-    if total:
-        info(f"Current token usage estimate: {total}/{MAX_TOKENS}")
-        if total >= MAX_TOKENS * WARN_THRESHOLD:
-            warn(f"Context window nearly full ({total}/{MAX_TOKENS}).")
-    return total
+def check_context_window(accumulated_tokens):
+    """Warn if accumulated token count is approaching the context window limit."""
+    if accumulated_tokens >= MAX_TOKENS * WARN_THRESHOLD:
+        warn(f"Accumulated tokens nearly at limit: {accumulated_tokens:,}/{MAX_TOKENS:,} ({(accumulated_tokens/MAX_TOKENS*100):.1f}%)")
+        return True
+    return False
 
 
 # === ENHANCED RATE LIMIT HANDLER ===
 def extract_retry_delay(exception) -> float:
     """Extract retry delay from API error details"""
+    #Tries to find how long we should wait before retrying when APİ tell us we'r too fast
+    #it takes and exception (erro) and returns the time to wait before retrying
     try:
         # Try to get from exception attributes
-        if hasattr(exception, 'retry_after'):
+        if hasattr(exception, 'retry_after'): #some APIs have build in "retry after " property. If it does returns that.
             return float(exception.retry_after)
         
+        #if not converts it to a text string
         # Try to parse from error message/details
         error_str = str(exception)
         
+        #regular expression module — a tool to search text using patterns
         # Look for "Please retry in X.Xs" or "retryDelay: Xs"
         import re
         
@@ -95,13 +96,13 @@ def extract_retry_delay(exception) -> float:
         if match:
             return float(match.group(1)) / 1000  # Convert ms to seconds
         
-        # Pattern 3: "retryDelay': 'XXs'" or "'retryDelay': 'XX.XXs'"
+        # Pattern 3: "retryDelay': 'XXs'" or "'retryDelay': 'XX.XXs'" JSON
         match = re.search(r"'retryDelay':\s*'(\d+(?:\.\d+)?)s'", error_str)
         if match:
             return float(match.group(1))
         
         # Pattern 4: Check if error has details attribute (for google.api_core exceptions)
-        if hasattr(exception, 'details'):
+        if hasattr(exception, 'details'): #checks errors details attribute
             details_str = str(exception.details)
             match = re.search(r'retryDelay.*?(\d+)s', details_str, re.IGNORECASE)
             if match:
@@ -110,42 +111,39 @@ def extract_retry_delay(exception) -> float:
     except Exception:
         pass
     
-    return 0
+    return 0 #returns 0 if it could not find any retry delay
 
 
 def safe_request(func):
-    """Decorator to handle rate limits with exponential backoff using API-suggested delays"""
-    def wrapper(*args, **kwargs):
-        for attempt in range(MAX_RETRIES):
+    """Decorator to handle rate limits with exponential backoff using API-suggested delays
+    
+    Detects rate-limit errors (429s).
+    Figures out how long to wait (either from API hints or exponential delay).
+    Retries up to 3 times.
+    """
+    def wrapper(*args, **kwargs): #inner func that takes any argument to wrap any func
+        for attempt in range(MAX_RETRIES): #loop to retry the fnction 3 times (MAX_RETRIES =3), wait time increases in each fail
             try:
                 return func(*args, **kwargs)
             except Exception as e:
-                # Check if this is a rate limit error
+                # Check if the error is rate limit or sth else
                 error_str = str(e).lower()
                 is_rate_limit = (
                     isinstance(e, (exceptions.ResourceExhausted, exceptions.TooManyRequests)) or
                     any(keyword in error_str for keyword in ["rate limit", "quota", "429"])
-                )
+                ) 
+                # 429 HTTP error code for too many requests. If matches one of these then rate limit error
                 
+                #If it’s not a rate-limit issue stops retrying
                 if not is_rate_limit:
                     error(f"Non-retryable error: {e}")
                     raise
                 
-                # Handle rate limit error
+                # Handle rate limit error. print warning
                 warn(f"Rate limit detected: {type(e).__name__}")
                 
-                # Extract and calculate retry delay
-                api_retry_delay = extract_retry_delay(e)
-                
-                if api_retry_delay > 0:
-                    # Use API's suggested delay minus 20 seconds (minimum 1 second)
-                    delay = max(1, api_retry_delay - API_DELAY_SUBTRACTION)
-                    info(f"API suggests retry after: {api_retry_delay:.1f}s")
-                    info(f"Using optimized delay: {delay:.1f}s (API delay - {API_DELAY_SUBTRACTION:.1f}ss)")
-                else:
-                    # Fallback to exponential backoff
-                    delay = RETRY_BASE_DELAY ** (attempt + 1)
-                    info(f"No API retry delay found, using exponential backoff: {delay}s")
+                delay = RETRY_BASE_DELAY ** (attempt + 1)
+                info(f"No API retry delay found, using exponential backoff: {delay}s")
                 
                 # Last attempt check
                 if attempt == MAX_RETRIES - 1:
@@ -173,9 +171,8 @@ def generate_text(client, prompt: str):
     PROMPT_TOKENS_TOTAL += prompt_tokens
     info(f"[TEXT] Prompt tokens: {prompt_tokens}")
 
-    # Context warning (optionally consider only prompt here; you can switch to a
-    # richer context if you decide to prepend system/instructions later)
-    check_context_window(client, prompt)
+    # Check accumulated token usage against threshold
+    check_context_window(PROMPT_TOKENS_TOTAL + RESPONSE_TOKENS_TOTAL)
 
     resp = client.models.generate_content(
         model=MODEL,
@@ -208,9 +205,8 @@ class ChatSession:
         PROMPT_TOKENS_TOTAL += prompt_tokens
         info(f"[CHAT] Prompt tokens (this user msg): {prompt_tokens}")
 
-        # For context warning, consider accumulated transcript + new user msg
-        full_context = "\n".join(self.history + [f"User: {message}"])
-        check_context_window(self.client, full_context)
+        # Check accumulated token usage against threshold
+        check_context_window(PROMPT_TOKENS_TOTAL + RESPONSE_TOKENS_TOTAL)
 
         # Send message
         resp = self.chat.send_message(message)
@@ -258,8 +254,8 @@ def measure_actual_rpm(client):
     while time.time() < end_time:
         total_attempts += 1
         current_time = time.time()
-        elapsed = current_time - start_time
-        remaining = end_time - current_time
+        elapsed = current_time - start_time #ne kadar zaman geçti
+        remaining = end_time - current_time #ne kadar zaman var bitmesine
         
         try:
             info(f"[{elapsed:.1f}s elapsed, {remaining:.1f}s remaining] Request #{total_attempts}")
@@ -333,86 +329,15 @@ def measure_actual_rpm(client):
     
     return rpm
 
-
-def prove_rate_limit_window(client):
-    """
-    Prove whether Gemini's 15 RPM limit uses:
-    - Rolling window (starts from first request)
-    - Fixed window (aligned to clock time)
-    
-    Test strategy:
-    1. Send 15 requests rapidly (should all succeed)
-    2. Send 16th request immediately (should fail if 15 RPM enforced)
-    3. Wait and retry to see when quota resets
-    """
-    print("\n" + "=" * 70)
-    print("RATE LIMIT WINDOW DETECTION TEST")
-    print("=" * 70)
-    
-    info("Testing Gemini's 15 requests/minute rate limit behavior...")
-    info("Expected: 15 requests should succeed, 16th should fail")
-    
-    request_times = []
-    success_count = 0
-    first_failure_time = None
-    
-    # Phase 1: Send requests rapidly to hit the limit
-    print("\n--- PHASE 1: Sending requests to hit 15 RPM limit ---")
-    for i in range(100):  # Try 20 to definitely hit the limit
-        request_start = time.time()
-        request_time_str = time.strftime('%H:%M:%S', time.localtime(request_start))
-        
-        try:
-            info(f"Request #{i+1} at {request_time_str}")
-            response = generate_text(
-                client,
-                f"Say the number {i}."
-            )
-            
-            # Capture actual success time (after any retries)
-            success_time = time.time()
-            success_time_str = time.strftime('%H:%M:%S', time.localtime(success_time))
-            
-            request_times.append({
-                'num': i + 1,
-                'time': success_time,
-                'time_str': success_time_str,
-                'success': True
-            })
-            success_count += 1
-            ok(f"✓ Request #{i+1} succeeded at {success_time_str}")
-            
-        except Exception as e:
-            request_times.append({
-                'num': i + 1,
-                'time': request_start,
-                'time_str': request_time_str,
-                'success': False,
-                'error': str(e)
-            })
-            
-            if first_failure_time is None:
-                first_failure_time = request_start
-                first_failure_request_num = i + 1
-            
-            error(f"✗ Request #{i+1} FAILED at {request_time_str}")
-            warn(f"Error: {e}")
-            
-            # If we hit rate limit, stop sending more requests
-            error_str = str(e).lower()
-            if any(x in error_str for x in ["rate limit", "quota", "429", "resource exhausted"]):
-                warn(f"Rate limit hit after {success_count} successful requests")
-                break
-    
-    first_request_time = request_times[0]['time']
-    first_request_str = request_times[0]['time_str']
-    
-    print(f"\n📊 Summary:")
-    print(f"   First request:  #{1} at {first_request_str}")
-    print(f"   Total successful: {success_count}")
-    print(f"   Total failed: {len(request_times) - success_count}")
-
 def stress_test_rate_limits(client):
+
+    """"When the rate limit starts hitting
+        How many succeeded or failed
+        How much time passed until the API said “too many requests
+        
+        Helps prove rate limit handler and retry logic work correctly
+    """
+    
     """Test rate limit handling with rapid requests"""
     print("\n" + "=" * 70)
     print("STRESS TEST: RATE LIMITS")
@@ -442,7 +367,7 @@ def stress_test_rate_limits(client):
             )
             print(f"Response: {response[:80]}...")
             successful += 1
-            time.sleep(0.1)  # Small delay
+            time.sleep(0.1)  # Small delay 0.1 seconds (100ms) before sending the next request. Spamming the API to cause a rate-limit
         except (exceptions.ResourceExhausted, exceptions.TooManyRequests) as e:
             # Log rate limit error time
             last_rate_error_time = time.time()
@@ -450,6 +375,7 @@ def stress_test_rate_limits(client):
             warn(f"Request {i+1} failed permanently: {e}")
             rate_limited += 1
         except Exception as e:
+            #If some other kind of exception happens, it still checks if the text of the error message contains signs of a rate limit
             # Check if it's a rate limit error in disguise
             error_str = str(e).lower()
             if any(x in error_str for x in ["rate limit", "quota", "429"]):
@@ -459,7 +385,7 @@ def stress_test_rate_limits(client):
             rate_limited += 1
     
     print("\n" + "-" * 70)
-    ok(f"Rate limit test complete: {successful} successful, {rate_limited} failed")
+    ok(f"Rate limit test complete: {successful} successful, {rate_limited} failed") #prints the results after 30 requests
     
     # Summary of timing
     if first_request_time:
@@ -473,6 +399,11 @@ def stress_test_rate_limits(client):
 
 
 def stress_test_context_window(client):
+    """"
+        When your warning system detects that you're near the context window limit (80%+)
+        Whether the model can still respond normally before reaching that limit.
+    """
+
     """Test context window warning system"""
     print("\n" + "=" * 70)
     print("STRESS TEST: CONTEXT WINDOW")
@@ -489,23 +420,24 @@ def stress_test_context_window(client):
         
         info(f"\nTest with {token_count:,} tokens (multiplier: {multiplier})")
         
-        if token_count < MAX_TOKENS * 0.9:
-            try:
-                response = generate_text(
-                    client,
-                    f"Summarize this in one sentence: {large_prompt[:1000]}"
-                )
-                print(f"Response: {response[:100]}...")
-            except Exception as e:
-                warn(f"Generation failed: {e}")
-        else:
-            warn("Skipping generation - would exceed context window")
+        try:
+            response = generate_text(
+                client,
+                f"Summarize this in one sentence: {large_prompt}"
+            )
+            print(f"Response: {response[:100]}...")
+        except Exception as e:
+            warn(f"Generation failed: {e}")
     
     ok("Context window test complete")
 
 
 def stress_test_chat_history(client):
-    """Test chat with long conversation history"""
+    """
+        Test chat with long conversation history
+        Incrementally adds messages to chat history
+        Checks if context window warnings trigger appropriately
+    """
     print("\n" + "=" * 70)
     print("STRESS TEST: CHAT HISTORY")
     print("=" * 70)
@@ -545,18 +477,17 @@ def main():
     print("\n--- TEXT GENERATION TEST ---")
     prompt = "Explain the difference between rate limits and context windows in simple terms."
     output = generate_text(client, prompt)
-    print("\nModel Output:\n", output)
+    print("\nModel Output:\n", output[:100])
 
     print("\n--- CHAT MODE TEST ---")
     chat = ChatSession(client)
     r1 = chat.send("Hello! Tell me a short story about testing APIs.")
-    print("\nChat 1:", r1)
+    print("\nChat 1:", r1[:100])
     r2 = chat.send("Summarize that story in one sentence and mention 'context window'.")
-    print("\nChat 2:", r2)
+    print("\nChat 2:", r2[:100])
 
     # === RUN STRESS TESTS ===
     # measure_actual_rpm(client)
-    # prove_rate_limit_window(client)
     # stress_test_rate_limits(client)
     stress_test_context_window(client)
     stress_test_chat_history(client)
